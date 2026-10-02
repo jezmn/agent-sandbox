@@ -24,9 +24,16 @@ jobs:
             EOF
             sudo apparmor_parser -r /etc/apparmor.d/agent-sandbox-bwrap
 
+      - name: Install shfmt
+        run: |
+            curl -sSLo /tmp/shfmt https://github.com/mvdan/sh/releases/download/v3.14.1/shfmt_v3.14.1_linux_amd64
+            chmod +x /tmp/shfmt
+            sudo mv /tmp/shfmt /usr/local/bin/shfmt
+
       - name: Check syntax and help
         run: |
             shellcheck agent-sandbox tests/*.sh
+            shfmt -i 4 -d agent-sandbox tests/*.sh
             bash -n agent-sandbox
             ./agent-sandbox --help
 
