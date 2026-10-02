@@ -5,25 +5,30 @@ home=$(realpath -e -- "$HOME")
 workdir="$home"
 project_mount=()
 extra_mounts=()
+hide_mounts=()
 mount_sources=()
 mount_destinations=()
 sandbox_path=
 program=()
 host=false
+dry_run=false
+rest=()
 help=false
 
 usage() {
     cat <<'EOF'
-Usage: agent-sandbox [-p [DIRECTORY]] [--ro PATH] [--rw PATH] -- PROGRAM [ARGS...]
+Usage: agent-sandbox [-p [DIRECTORY]] [--ro PATH[,PATH...]] [--rw PATH[,PATH...]] -- PROGRAM [ARGS...]
        agent-sandbox --command PROGRAM [SANDBOX OPTIONS] [PROGRAM ARGS...]
 
-  -p, --project  Mount a project read-write (current directory if omitted)
-  --ro PATH [DEST] Mount a path read-only
-  --rw PATH [DEST] Mount a path read-write
-  --command PATH Set the program for an agent wrapper
-  --path DIR     Prepend a directory to PATH inside the sandbox
-  --host         Run the program without the sandbox
-  -h, --help     Show sandbox help and, if specified, program help
+  -p, --project                                     Mount a project read-write (current directory if omitted)
+  --ro PATH[,PATH...] [DEST]                        Mount path(s) read-only
+  --rw PATH[,PATH...] [DEST]                        Mount path(s) read-write
+  --hide PATH[,PATH...], --exclude PATH[,PATH...]   Mask file(s) or directories inside the sandbox (e.g. a .env)
+  --command PATH                                    Set the program for an agent wrapper
+  --path DIR                                        Prepend a directory to PATH inside the sandbox
+  --host                                            Run the program without the sandbox
+  --dry-run                                         Print the bwrap command without running it
+  -h, --help                                        Show sandbox help and, if specified, program help
 EOF
 }
 
@@ -34,9 +39,40 @@ check_path() {
     fi
 }
 
-while (( $# )); do
-    case "$1" in
-        -h|--help)
+resolve_path() {
+    realpath -e -- "$2" 2>/dev/null || {
+        printf '%s\n' "$1: not found: $2" >&2
+        exit 1
+    }
+}
+
+add_mount() {
+    local path
+    path=$(resolve_path "$2" "$1")
+    check_path "$path"
+    if [[ "$2" == --ro ]]; then
+        extra_mounts+=(--ro-bind "$path" "${3:-$path}")
+    else
+        extra_mounts+=(--bind "$path" "${3:-$path}")
+    fi
+    mount_sources+=("$path")
+    mount_destinations+=("${3:-$path}")
+}
+
+add_hide() {
+    local path
+    path=$(resolve_path "--hide" "$1")
+    if [[ -d "$path" ]]; then
+        hide_mounts+=(--tmpfs "$path")
+    else
+        hide_mounts+=(--ro-bind /dev/null "$path")
+    fi
+}
+
+parse_args() {
+    while (($#)); do
+        case "$1" in
+        -h | --help)
             help=true
             shift
             ;;
@@ -44,131 +80,175 @@ while (( $# )); do
             host=true
             shift
             ;;
+        --dry-run)
+            dry_run=true
+            shift
+            ;;
         --command)
-            if (( $# < 2 )) || [[ "$2" == -* ]]; then
+            if (($# < 2)) || [[ "$2" == -* ]]; then
                 printf '%s requires a program.\n' "$1" >&2
                 exit 1
             fi
             program=("$2")
             shift 2
             ;;
-        -p|--project)
+        -p | --project)
             shift
             path="$PWD"
-            if (( $# )) && [[ "$1" != -* ]]; then
+            if (($#)) && [[ "$1" != -* ]]; then
                 path="$1"
                 shift
             fi
-            path=$(realpath -e -- "$path")
-            [[ -d "$path" ]] || { printf 'Not a directory: %s\n' "$path" >&2; exit 1; }
+            path=$(resolve_path "--project" "$path")
+            [[ -d "$path" ]] || {
+                printf 'Not a directory: %s\n' "$path" >&2
+                exit 1
+            }
             check_path "$path"
             workdir="$path"
             project_mount=(--bind "$path" "$path")
             ;;
         --path)
-            if (( $# < 2 )) || [[ "$2" == -* ]]; then
+            if (($# < 2)) || [[ "$2" == -* ]]; then
                 printf '%s requires a directory.\n' "$1" >&2
                 exit 1
             fi
-            path=$(realpath -e -- "$2")
-            [[ -d "$path" ]] || { printf 'Not a directory: %s\n' "$2" >&2; exit 1; }
+            path=$(resolve_path "--path" "$2")
+            [[ -d "$path" ]] || {
+                printf 'Not a directory: %s\n' "$2" >&2
+                exit 1
+            }
             sandbox_path="${sandbox_path:+$sandbox_path:}$path"
             shift 2
             ;;
-        --ro|--rw)
+        --ro | --rw)
             access="$1"
             shift
-            if (( $# == 0 )) || [[ "$1" == -- ]]; then
+            if (($# == 0)) || [[ "$1" == -- ]]; then
                 printf '%s requires a path.\n' "$access" >&2
                 exit 1
             fi
-            path=$(realpath -e -- "$1")
-            check_path "$path"
-            dest="$path"
-            if (( $# > 1 )) && [[ "$2" == /* ]]; then
-                dest="$2"
-                shift
-            fi
-            if [[ "$access" == --ro ]]; then
-                extra_mounts+=(--ro-bind "$path" "$dest")
-            else
-                extra_mounts+=(--bind "$path" "$dest")
-            fi
-            mount_sources+=("$path")
-            mount_destinations+=("$dest")
+            IFS=',' read -ra sources <<<"$1"
             shift
+            dest=""
+            if ((${#sources[@]} == 1)) && (($#)) && [[ "$1" == /* ]]; then
+                dest="$1"
+                shift
+            elif (($#)) && [[ "$1" == /* ]]; then
+                printf '%s takes one destination; repeat the flag for multiple paths.\n' "$access" >&2
+                exit 1
+            fi
+            for src in "${sources[@]}"; do
+                add_mount "$src" "$access" "$dest"
+            done
+            ;;
+        --hide | --exclude)
+            shift
+            if (($# == 0)) || [[ "$1" == -- ]]; then
+                printf '%s requires a path.\n' "--hide" >&2
+                exit 1
+            fi
+            IFS=',' read -ra sources <<<"$1"
+            shift
+            for src in "${sources[@]}"; do
+                add_hide "$src"
+            done
             ;;
         --)
             shift
             break
             ;;
         *)
-            if (( ${#program[@]} )); then break; fi
+            if ((${#program[@]})); then break; fi
             printf 'Unknown option: %s\n' "$1" >&2
             usage >&2
             exit 1
             ;;
-    esac
-done
-
-set -- "${program[@]}" "$@"
-if "$host" || "$help"; then
-    for i in "${!mount_destinations[@]}"; do
-        if [[ "$1" == "${mount_destinations[i]}" ]]; then
-            set -- "${mount_sources[i]}" "${@:2}"
-        fi
+        esac
     done
-fi
-if "$help"; then
-    usage
-    if (( $# )); then exec "$1" --help; fi
-    exit 0
-fi
+    rest=("$@")
+}
 
-if (( $# == 0 )); then
-    printf 'Specify a program after --.\n' >&2
-    exit 1
-fi
+main() {
+    parse_args "$@"
 
-if "$host"; then
-    printf 'agent-sandbox: host mode (no sandbox)\n' >&2
-    exec "$@"
-fi
+    if "$dry_run" && "$host"; then
+        printf '%s\n' '--dry-run and --host are mutually exclusive.' >&2
+        exit 1
+    fi
 
-if (( ${#project_mount[@]} )); then
-    printf 'agent-sandbox: project %s\n' "$workdir" >&2
-else
-    printf 'agent-sandbox: chat mode (no project mounted)\n' >&2
-fi
+    set -- "${program[@]}" "${rest[@]}"
+    if "$host" || "$help"; then
+        for i in "${!mount_destinations[@]}"; do
+            if [[ "$1" == "${mount_destinations[i]}" ]]; then
+                set -- "${mount_sources[i]}" "${@:2}"
+            fi
+        done
+    fi
+    if "$help"; then
+        usage
+        if (($#)); then exec "$1" --help; fi
+        exit 0
+    fi
 
-lib64=$(readlink -f /lib64)
-if [[ "$lib64" != /usr/lib && "$lib64" != /usr/lib64 ]]; then
-    printf 'Unsupported /lib64 layout: %s\n' "$lib64" >&2
-    exit 1
-fi
+    if (($# == 0)); then
+        printf 'Specify a program after --.\n' >&2
+        exit 1
+    fi
 
-exec bwrap \
-    --ro-bind /usr /usr \
-    --symlink usr/bin /bin \
-    --symlink usr/lib /lib \
-    --symlink "${lib64#/}" /lib64 \
-    --ro-bind /etc/ssl /etc/ssl \
-    --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
-    --ro-bind /etc/resolv.conf /etc/resolv.conf \
-    --ro-bind /etc/hosts /etc/hosts \
-    --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
-    --proc /proc --dev /dev --tmpfs /tmp \
-    --dir /home --dir "$home" \
-    --dir "$home/.config" \
-    --dir "$home/.local" --dir "$home/.local/share" --dir "$home/.local/state" \
-    --dir "$home/.cache" \
-    "${project_mount[@]}" \
-    "${extra_mounts[@]}" \
-    --chdir "$workdir" \
-    --unshare-pid --unshare-ipc --die-with-parent \
-    --clearenv \
-    --setenv PATH "${sandbox_path:+$sandbox_path:}/usr/bin:/bin" \
-    --setenv HOME "$home" \
-    --setenv TERM "${TERM:-xterm-256color}" \
-    --setenv LANG "${LANG:-C.UTF-8}" \
-    "$@"
+    if "$host"; then
+        printf 'agent-sandbox: host mode (no sandbox)\n' >&2
+        exec "$@"
+    fi
+
+    if ((${#project_mount[@]})); then
+        printf 'agent-sandbox: project %s\n' "$workdir" >&2
+    else
+        printf 'agent-sandbox: chat mode (no project mounted)\n' >&2
+    fi
+
+    lib64=$(readlink -f /lib64)
+    if [[ "$lib64" != /usr/lib && "$lib64" != /usr/lib64 ]]; then
+        printf 'Unsupported /lib64 layout: %s\n' "$lib64" >&2
+        exit 1
+    fi
+
+    bwrap_args=(
+        --ro-bind /usr /usr
+        --symlink usr/bin /bin
+        --symlink usr/lib /lib
+        --symlink "${lib64#/}" /lib64
+        --ro-bind /etc/ssl /etc/ssl
+        --ro-bind-try /etc/ca-certificates /etc/ca-certificates
+        --ro-bind /etc/resolv.conf /etc/resolv.conf
+        --ro-bind /etc/hosts /etc/hosts
+        --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
+        --proc /proc --dev /dev --tmpfs /tmp
+        --dir /home --dir "$home"
+        --dir "$home/.config"
+        --dir "$home/.local" --dir "$home/.local/share" --dir "$home/.local/state"
+        --dir "$home/.cache"
+        "${project_mount[@]}"
+        "${extra_mounts[@]}"
+        "${hide_mounts[@]}"
+        --chdir "$workdir"
+        --unshare-pid --unshare-ipc --die-with-parent
+        --clearenv
+        --setenv PATH "${sandbox_path:+$sandbox_path:}/usr/bin:/bin"
+        --setenv HOME "$home"
+        --setenv TERM "${TERM:-xterm-256color}"
+        --setenv LANG "${LANG:-C.UTF-8}"
+        "$@"
+    )
+
+    if "$dry_run"; then
+        printf '%q ' bwrap "${bwrap_args[@]}"
+        printf '\n'
+        exit 0
+    fi
+    exec bwrap "${bwrap_args[@]}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
