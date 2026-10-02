@@ -1,10 +1,10 @@
 # agent-sandbox
 
-Filesystem isolation for AI coding agents. It runs commands without exposing home files such as documents, 
+Filesystem isolation for AI coding agents. It runs commands without exposing home files such as documents,
 projects, and secrets. Built on Bubblewrap, agent-sandbox provides a shared launcher with per-agent wrappers 
 that define their own filesystem access.
 
-# Why
+## Why
 
 AI coding agents run arbitrary commands. Your home holds secrets, keys and unrelated projects. 
 agent-sandbox gives each agent only the project and paths you mount, nothing else.
@@ -66,7 +66,11 @@ bash tests/launcher.sh   # syntax, argument passing, host mode
 bash tests/mounts.sh     # actual read-only and read-write mounts
 ```
 
-They need Bubblewrap working on the machine.
+```sh
+shellcheck agent-sandbox tests/*.sh
+shfmt -i 4 -d agent-sandbox tests/*.sh   # check only
+shfmt -i 4 -w agent-sandbox tests/*.sh   # format in place
+```
 
 ## Agent wrappers
 
@@ -101,7 +105,8 @@ Add the shortcut to `~/.bashrc`:
 opencode() { "$HOME/.local/bin/opencode-sandbox" "$@"; }
 ```
 
-Use the same pattern for other agents, with their own wrapper files and shortcuts. Only OpenCode has been tried so far; the others need their own mounts and testing.
+Use the same pattern for other agents, with their own wrapper files and shortcuts. 
+Only OpenCode has been tried so far; the others need their own mounts and testing.
 
 Two more options, for binaries outside `/usr/bin`:
 
@@ -113,17 +118,46 @@ Two more options, for binaries outside `/usr/bin`:
 `--ro` and `--rw` take an optional second path to mount somewhere else
 inside (`--rw SRC DST`), for example to run a binary from `/opt`.
 
-# Usage
+## Usage
 
 ```sh
 opencode                                # Chat without mounting a project
 opencode -p                             # Work on the current directory
-opencode -p ~/Projects/my-project       # Work on another directory
-opencode -p --ro ~/Downloads            # Read another directory
-opencode -p --rw ~/Documents            # Read and write another directory
+opencode -p "$HOME/Project"             # Work on another directory
+opencode -p --ro "$HOME/Downloads"      # Read another directory
+opencode -p --rw "$HOME/Documents"      # Read and write another directory
+opencode -p --hide "$HOME/Project/.env" # Work but keep secrets hidden
 opencode --host                         # Run without the sandbox
 opencode --help                         # Show wrapper and OpenCode help
 ```
+
+### Mounts
+
+`--ro` and `--rw` mount paths read-only or read-write. Both accept a
+comma-separated list and can be repeated:
+
+`--ro "$HOME/Downloads,$HOME/Music"`
+
+### Hiding secrets
+
+`--hide` (or `--exclude`) masks a file or directory inside the sandbox so
+the agent can neither read nor write through it. Useful for `.env` files
+inside an otherwise mounted project.
+
+### Strict paths
+
+Every path must exist. A missing path aborts before starting anything
+with a `--flag: not found: path` error.
+
+### Project
+
+`-p` (or `--project`) mounts a project read-write and defaults to the
+current directory when omitted.
+
+### Inspection
+
+`--dry-run` prints the `bwrap` command the sandbox would run without
+running it. Useful to audit what the agent would see.
 
 ## MCP examples
 
