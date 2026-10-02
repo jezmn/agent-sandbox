@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -e
+
+home=$(realpath -e -- "$HOME")
+workdir="$home"
+project_mount=()
+extra_mounts=()
+mount_sources=()
+mount_destinations=()
+sandbox_path=
+program=()
+host=false
+help=false
+
+usage() {
+    cat <<'EOF'
+Usage: agent-sandbox [-p [DIRECTORY]] [--ro PATH] [--rw PATH] -- PROGRAM [ARGS...]
+       agent-sandbox --command PROGRAM [SANDBOX OPTIONS] [PROGRAM ARGS...]
+
+  -p, --project  Mount a project read-write (current directory if omitted)
+  --ro PATH [DEST] Mount a path read-only
+  --rw PATH [DEST] Mount a path read-write
+  --command PATH Set the program for an agent wrapper
+  --path DIR     Prepend a directory to PATH inside the sandbox
+  --host         Run the program without the sandbox
+  -h, --help     Show sandbox help and, if specified, program help
+EOF
+}
+
+check_path() {
+    if [[ "$1" == / || "$1" == "$home" || "$home" == "$1/"* ]]; then
+        printf 'Refusing to mount HOME or a directory containing it.\n' >&2
+        exit 1
+    fi
+}
+
+while (( $# )); do
+    case "$1" in
+        -h|--help)
+            help=true
+            shift
+            ;;
+        --host)
+            host=true
+            shift
+            ;;
+        --command)
+            if (( $# < 2 )) || [[ "$2" == -* ]]; then
+                printf '%s requires a program.\n' "$1" >&2
+                exit 1
+            fi
+            program=("$2")
+            shift 2
+            ;;
+        -p|--project)
+            shift
+            path="$PWD"
+            if (( $# )) && [[ "$1" != -* ]]; then
+                path="$1"
+                shift
+            fi
+            path=$(realpath -e -- "$path")
+            [[ -d "$path" ]] || { printf 'Not a directory: %s\n' "$path" >&2; exit 1; }
+            check_path "$path"
+            workdir="$path"
+            project_mount=(--bind "$path" "$path")
+            ;;
+        --path)
+            if (( $# < 2 )) || [[ "$2" == -* ]]; then
+                printf '%s requires a directory.\n' "$1" >&2
+                exit 1
+            fi
+            path=$(realpath -e -- "$2")
+            [[ -d "$path" ]] || { printf 'Not a directory: %s\n' "$2" >&2; exit 1; }
+            sandbox_path="${sandbox_path:+$sandbox_path:}$path"
+            shift 2
+            ;;
+        --ro|--rw)
+            access="$1"
+            shift
+            if (( $# == 0 )) || [[ "$1" == -- ]]; then
+                printf '%s requires a path.\n' "$access" >&2
+                exit 1
+            fi
+            path=$(realpath -e -- "$1")
+            check_path "$path"
+            dest="$path"
+            if (( $# > 1 )) && [[ "$2" == /* ]]; then
+                dest="$2"
+                shift
+            fi
+            if [[ "$access" == --ro ]]; then
+                extra_mounts+=(--ro-bind "$path" "$dest")
+            else
+                extra_mounts+=(--bind "$path" "$dest")
+            fi
+            mount_sources+=("$path")
+            mount_destinations+=("$dest")
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            if (( ${#program[@]} )); then break; fi
+            printf 'Unknown option: %s\n' "$1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+set -- "${program[@]}" "$@"
+if "$host" || "$help"; then
+    for i in "${!mount_destinations[@]}"; do
+        if [[ "$1" == "${mount_destinations[i]}" ]]; then
+            set -- "${mount_sources[i]}" "${@:2}"
+        fi
+    done
+fi
+if "$help"; then
+    usage
+    if (( $# )); then exec "$1" --help; fi
+    exit 0
+fi
+
+if (( $# == 0 )); then
+    printf 'Specify a program after --.\n' >&2
+    exit 1
+fi
+
+if "$host"; then
+    printf 'agent-sandbox: host mode (no sandbox)\n' >&2
+    exec "$@"
+fi
+
+if (( ${#project_mount[@]} )); then
+    printf 'agent-sandbox: project %s\n' "$workdir" >&2
+else
+    printf 'agent-sandbox: chat mode (no project mounted)\n' >&2
+fi
+
+lib64=$(readlink -f /lib64)
+if [[ "$lib64" != /usr/lib && "$lib64" != /usr/lib64 ]]; then
+    printf 'Unsupported /lib64 layout: %s\n' "$lib64" >&2
+    exit 1
+fi
+
+exec bwrap \
+    --ro-bind /usr /usr \
+    --symlink usr/bin /bin \
+    --symlink usr/lib /lib \
+    --symlink "${lib64#/}" /lib64 \
+    --ro-bind /etc/ssl /etc/ssl \
+    --ro-bind-try /etc/ca-certificates /etc/ca-certificates \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --ro-bind /etc/hosts /etc/hosts \
+    --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf \
+    --proc /proc --dev /dev --tmpfs /tmp \
+    --dir /home --dir "$home" \
+    --dir "$home/.config" \
+    --dir "$home/.local" --dir "$home/.local/share" --dir "$home/.local/state" \
+    --dir "$home/.cache" \
+    "${project_mount[@]}" \
+    "${extra_mounts[@]}" \
+    --chdir "$workdir" \
+    --unshare-pid --unshare-ipc --die-with-parent \
+    --clearenv \
+    --setenv PATH "${sandbox_path:+$sandbox_path:}/usr/bin:/bin" \
+    --setenv HOME "$home" \
+    --setenv TERM "${TERM:-xterm-256color}" \
+    --setenv LANG "${LANG:-C.UTF-8}" \
+    "$@"
