@@ -1,0 +1,37 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bubblewrap
+        run: |
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y bubblewrap apparmor-utils shellcheck
+
+      - name: Allow Bubblewrap user namespaces
+        run: |
+            sudo tee /etc/apparmor.d/agent-sandbox-bwrap >/dev/null <<'EOF'
+            abi <abi/4.0>,
+            include <tunables/global>
+            profile agent-sandbox-bwrap /usr/bin/bwrap flags=(unconfined) {
+              userns,
+            }
+            EOF
+            sudo apparmor_parser -r /etc/apparmor.d/agent-sandbox-bwrap
+
+      - name: Check syntax and help
+        run: |
+            shellcheck agent-sandbox tests/*.sh
+            bash -n agent-sandbox
+            ./agent-sandbox --help
+
+      - name: Check wrapper argument handling
+        run: bash tests/launcher.sh
+
+      - name: Check actual mounts
+        run: bash tests/mounts.sh
