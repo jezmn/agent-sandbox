@@ -88,8 +88,12 @@ exec "$HOME/.local/bin/agent-sandbox" \
   --rw "$HOME/.local/share/opencode" \
   --rw "$HOME/.cache/opencode" \
   --rw "$HOME/.local/state/opencode" \
-  "$@"
+  "$@" \
+  --standalone
 ```
+
+`--standalone` keeps execution inside the sandbox instead of the host
+background service.
 
 In `--host` mode, a command mounted at a different destination runs from its original path on the host.
 
@@ -104,6 +108,8 @@ Add the shortcut to `~/.bashrc`:
 ```bash
 opencode() { "$HOME/.local/bin/opencode-sandbox" "$@"; }
 ```
+
+Run it from an interactive terminal.
 
 Use the same pattern for other agents, with their own wrapper files and shortcuts. 
 Only OpenCode has been tried so far; the others need their own mounts and testing.
